@@ -2,7 +2,8 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : This program implements the state machine for a robotic
+  * 				          system.
   ******************************************************************************
   * @attention
   *
@@ -23,33 +24,28 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <string.h>
-#include <stdio.h>
+#include "stdbool.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef SystemState {
+  Init_State,
+  Transit_State,
+  Object_Detect_Transit_State
+};
 
-//Different states
-typedef enum
-{
-    Init_State,
-	Transit_State,
-	Obstacle_Detect_Transit_State,
-} eSystemState;
-
-//Different type events
-typedef enum
-{
-	Light_Detect_Event,
-	Light_Out_Of_Range_Event,
-	Obstacle_Detect_Event,
-} eSystemEvent;
-
+typedef SystemEvent {
+  Light_Detect_Event,
+  Obstacle_Detect_Event
+};
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define FAST 110
+#define MODERATE 70
+#define SLOW 50
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,13 +67,18 @@ UART_HandleTypeDef huart2;
 /* USER CODE BEGIN PV */
 static const uint8_t PC8591_ADDR = 0x48 << 1; // Use 8-bit address
 int servo_pwm = 0;
-int close = 3;
-int pwm_scale = 250;
-int pwm_light = 0;
-int pwm_dist = 0;
+int pwm_scale = 190;
+int pwm_light1 = 0;
+int pwm_light2 = 0;
+int pwm_dist1 = 0;
+int pwm_dist2 = 0;
+int obj_right = 0;
+int obj_left = 0;
 double rebound_angle = 0;
+int brightest_one = 0; // init_state var: record brightest light read
+int brightest_two = 0; // init_state var: record brightest light read
 uint8_t buf[20];
-
+int light_vals[3];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -96,44 +97,47 @@ static void MX_TIM5_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 uint32_t IC_Val1 = 0;
 uint32_t IC_Val2 = 0;
-uint32_t Difference = 0;
-uint8_t Is_First_Captured = 0;  // is the first value captured ?
+uint32_t difference = 0;
+uint8_t isFirstCaptured = 0;  // boolean: is the first value captured
 
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
-	if (htim->Instance == TIM2)  // if the interrupt source is tim2
-	{
-		if (Is_First_Captured==0) // if the first value is not captured
-		{
-			IC_Val1 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1); // read the first value
-			Is_First_Captured = 1;  // set the first captured as true
-			// Now change the polarity to falling edge
+/**
+  * @brief Called when an interrupt is generated. Captures the "on" 
+  * duration for the Echo PWM signal from the ultrasonic signal, 
+  * which corresponds to the relative distance of the nearest object.
+  * @modifies IC_Val1, ICVal2, difference, isFirstCaptured
+  * @param htim (pointer to timer that triggered the interrupt)
+  * @retval None
+  */
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
+	if (htim->Instance == TIM2) { // interrupt source is TIM2
+		if (!isFirstCaptured) { // first value not captured
+			IC_Val1 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1); // read first value
+			isFirstCaptured = 1;  // set first captured as true
+
+			// change polarity to falling edge
 			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
 		}
-
-		else if (Is_First_Captured==1)   // if the first is already captured
-		{
+		else {  // if the first already captured
 			IC_Val2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);  // read second value
 			__HAL_TIM_SET_COUNTER(htim, 0);  // reset the counter
 
-			if (IC_Val2 > IC_Val1)
-			{
-				Difference = IC_Val2-IC_Val1;
+			if (IC_Val2 > IC_Val1) {
+				difference = IC_Val2 - IC_Val1;
 			}
 
-			Is_First_Captured = 0; // set it back to false
+			isFirstCaptured = 0; // set it back to false
 
 			// set polarity to rising edge
 			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
+		} //else
+	} //if
+} //HAL_TIM_IC_CaptureCallback()
 
-		}
-	}
-}
-
-int get_light_val() {
+// EFFECTS: returns light intensity reading from photovoltaic cell
+// on PC8591 module
+int getLightIntensity() {
 	HAL_StatusTypeDef ret;
 	uint8_t buf[20];
 	// Tell TMP102 that we want to read from the temperature register
@@ -146,122 +150,324 @@ int get_light_val() {
 	  // Read 2 bytes from the temperature register
 	  ret = HAL_I2C_Master_Receive(&hi2c1, PC8591_ADDR, buf, 2, HAL_MAX_DELAY);
 	  if ( ret != HAL_OK ) {
-		strcpy((char*)buf, "Error Rx\r\n");
+		  strcpy((char*)buf, "Error Rx\r\n");
 	  }
 	}
 	return buf[1]; // second read is more reliable
 }
 
-int get_dist_val() {
+/**
+  * @brief returns value of difference (global var) that is computed in 
+  * HAL_TIM_IC_CaptureCallback()
+  * @param None
+  * @retval distance reading to nearest object detected by ultrasonic
+  * sensor
+  */
+int getDist() {
 	__HAL_TIM_SetCompare(&htim5, TIM_CHANNEL_2, 5);
-	uint32_t number = Difference;
-	return number;
+	return difference;
 }
 
+/**
+  * @brief stops all motion
+  * @param None
+  * @retval None
+  */
 void brake() {
 	__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, 0);
 	__HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1, 0);
 }
 
+/**
+  * @brief pivots robot to the right (in place) for specified 
+  * duration (timer)
+  * @param timer (duration of pivot), use an int multiple of
+  * pwm_scale
+  * @retval None
+  */
 void turnR(uint32_t timer) {
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, 1);
 	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, 0);
-	__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, 0);
-	__HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1, 100);
+	__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, FAST);
+	__HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1, FAST);
 	HAL_Delay(timer);
 	brake();
 }
 
+/**
+  * @brief pivots robot to the left (in place) for specified 
+  * duration (timer)
+  * @param timer (duration of pivot), use an int multiple of
+  * pwm_scale
+  * @retval None
+  */
 void turnL(uint32_t timer) {
 	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, 0);
-	__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, 100);
-	__HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1, 0);
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, 1);
+	__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, FAST);
+	__HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1, FAST);
 	HAL_Delay(timer);
 	brake();
 }
 
-void moveF(uint32_t timer, int speed) {
+/**
+  * @brief moves robot forward at specified speed for 
+  * specified duration (timer)
+  * @param speed use macros SLOW, MODERATE, and FAST
+  * @retval None
+  */
+void moveF(int speed) {
 	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, 0);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, 0);
 	__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, speed);
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, 0);
 	__HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1, speed);
-	HAL_Delay(timer);
 }
 
-//Prototype of eventhandlers
-eSystemState LightDetectHandler()
+/**
+  * @brief moves robot backwards at specified speed for 
+  * specified duration (timer)
+  * @param speed -- use macros SLOW, MODERATE, and FAST
+  * @retval None
+  */
+void reverse(int speed) {
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, 1);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, 1);
+	__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, speed);
+	__HAL_TIM_SetCompare(&htim4, TIM_CHANNEL_1, speed);
+}
+
+/**
+  * @brief manuvers around right side of object
+  * @param None
+  * @retval None
+  */
+void travelOnRight() {
+  turnR(10*pwm_scale);
+	moveF(FAST);
+	turnL(5*pwm_scale);
+}
+
+/**
+  * @brief manuvers around left side of object
+  * @param None
+  * @retval None
+  */
+void travelOnLeft() {
+  turnL(10*pwm_scale);
+  moveF(FAST);
+  turnR(5*pwm_scale);
+}
+
+/**
+  * @brief appropriately avoids object using boolean values 
+  * indicating presence of objects on the right or left side of robot
+  * @param objR -- true if object on the right
+  * @param objL -- true if object on the left
+  * @retval None
+  */
+// EFFECTS: 
+void objectAvoid(bool objR, bool objL) {
+	if(!objL) { // left side clear
+		travelOnLeft();
+	}
+  else if(objR && objL) { // both sides occupied
+		reverse(FAST);
+    travelOnRight();
+	}
+	else { // right or both sides clear
+		travelOnRight();
+	}
+}
+
+SystemEvent ReadEvent(int *brightest) {
+	SystemEvent event = Light_Detect_Event;
+	uint8_t curr_light = 0;
+	uint32_t curr_dist = 0;
+//	double N = 21;
+//	double alpha_0 = 8.57142857;
+//	double num = 0; // numerator of rebound_angle
+//	double denom = 0; // denominator of rebound_angle
+//	int i = -N/2;
+	obj_right = 0;
+	obj_left = 0;
+	int closest = 1;
+	*brightest = 255;
+	for(servo_pwm = 5; servo_pwm < 26; ++servo_pwm) {
+		__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_3, servo_pwm); // send servo pwm sig
+		HAL_Delay(50);
+		curr_light = getLightIntensity();
+		if(curr_light < *brightest && event != Obstacle_Detect_Event) {
+			pwm_light1 = servo_pwm;
+			*brightest = curr_light;
+		}
+		curr_dist = getDist();
+		if(curr_dist == closest && servo_pwm > 11 && servo_pwm < 19) {
+			brake();
+			closest = curr_dist;
+			pwm_dist1 = servo_pwm;
+			event = Obstacle_Detect_Event;
+		}
+//		num += (i*alpha_0*curr_dist);
+//		denom += curr_dist;
+//		++i;
+	}
+	sprintf((char*)buf, "LIGHT_PWM1 %u\r\n", (unsigned int) pwm_light1);
+	HAL_UART_Transmit(&huart2, buf, strlen((char*)buf), HAL_MAX_DELAY);
+	*brightest = 255;
+	for(servo_pwm = 24; servo_pwm > 5; --servo_pwm) {
+		__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_3, servo_pwm); // send servo pwm sig
+		HAL_Delay(50);
+		curr_light = getLightIntensity();
+		if(curr_light < *brightest && event != Obstacle_Detect_Event) {
+			pwm_light2 = servo_pwm;
+			*brightest = curr_light;
+			event = Light_Detect_Event;
+		}
+		curr_dist = getDist();
+		if(curr_dist == closest) {
+			if(servo_pwm <= 11) {
+				obj_right = 1;
+			}
+			else if(servo_pwm > 11 && servo_pwm < 19) {
+				brake();
+				closest = curr_dist;
+				pwm_dist2 = servo_pwm;
+				event = Obstacle_Detect_Event;
+			}
+			else if(servo_pwm >= 19) {
+				obj_left = 1;
+			}
+		}
+	}
+	sprintf((char*)buf, "LIGHT_PWM2 %u\r\n", (unsigned int) pwm_light2);
+	HAL_UART_Transmit(&huart2, buf, strlen((char*)buf), HAL_MAX_DELAY);
+//	rebound_angle = num/denom;
+	return event;
+}
+
+SystemState LightDetectHandler()
 {
-	if(pwm_light > 15) {
-		turnL((pwm_light - 15)*pwm_scale);
+	int average = (pwm_light1 + pwm_light2)/2;
+	if(average > 15) {
+		turnL((average - 15)*pwm_scale);
 	}
 	else {
-		turnR((15 - pwm_light)*pwm_scale);
+		turnR((15 - average)*pwm_scale);
 	}
-	moveF(100, 50);
+	moveF(SLOW); // move indefinitely
     return Transit_State;
 }
-eSystemState LightOutOfRangeHandler()
+
+SystemState LightOutOfRangeHandler()
 {
-	turnL(20*pwm_scale);
-    return Init_State;
+	turnL(20*pwm_scale); // do a 180
+	ReadEvent(&brightest_two); // find brightest
+	if(brightest_one < brightest_two) { // first read had our light sources
+		turnL(20*pwm_scale); // turn back
+	}
+	brightest_one = 255; // reset vars
+	brightest_two = 255;
+	return Transit_State;
 }
-eSystemState ObstacleDetectHandler()
+
+SystemState ObstacleDetectHandler()
 {
+	sprintf((char*)buf, "PWM_DIST1 %u\r\n", (unsigned int) pwm_dist1);
+	HAL_UART_Transmit(&huart2, buf, strlen((char*)buf), HAL_MAX_DELAY);
+	sprintf((char*)buf, "PWM_DIST2 %u\r\n", (unsigned int) pwm_dist2);
+	HAL_UART_Transmit(&huart2, buf, strlen((char*)buf), HAL_MAX_DELAY);
+	if(pwm_dist1 == 18 && pwm_dist2 == 12) { // large obj or two in front
+		if(!obj_right && !obj_left) { // go right if both sides clear
+			turnR(10*pwm_scale);
+			moveF(1000, FAST);
+			turnL(5*pwm_scale);
+		}
+		else if(obj_right && !obj_left) { // nothing to the left
+			turnL(10*pwm_scale);
+			moveF(1000, FAST);
+			turnR(5*pwm_scale);
+		}
+		else if(!obj_right && obj_left) { // nothing to the right
+			turnR(10*pwm_scale);
+			moveF(1000, 110);
+			turnL(5*pwm_scale);
+		}
+		else { // reverse if both sides occupied
+			reverse(FAST);
+			turnR(10*pwm_scale);
+			moveF(700, 110);
+			turnL(5*pwm_scale);
+		}
+	}
+	else if(pwm_dist1 > 15) {
+		if(!obj_right && !obj_left) { // go right if both sides clear
+			turnR(7*pwm_scale);
+			moveF(700, 110);
+			turnL(5*pwm_scale);
+		}
+		else if(obj_right && !obj_left) { // nothing to the left
+			turnL(7*pwm_scale);
+			moveF(700, 110);
+			turnR(5*pwm_scale);
+		}
+		else if(!obj_right && obj_left) { // nothing to the right
+			turnR(7*pwm_scale);
+			moveF(700, 110);
+			turnL(5*pwm_scale);
+		}
+		else { // reverse if both sides occupied
+			reverse(FAST);
+			turnR(7*pwm_scale);
+			moveF(700, 110);
+			turnL(5*pwm_scale);
+		}
+	}
+	else {
+		if(!obj_right && !obj_left) { // go left if both sides clear
+			turnL(7*pwm_scale);
+			moveF(700, 110);
+			turnR(5*pwm_scale);
+		}
+		else if(obj_right && !obj_left) { // nothing to the left
+			turnL(7*pwm_scale);
+			moveF(700, 110);
+			turnR(5*pwm_scale);
+		}
+		else if(!obj_right && obj_left) { // nothing to the right
+			turnR(7*pwm_scale);
+			moveF(700, 110);
+			turnL(5*pwm_scale);
+		}
+		else { // reverse if both sides occupied
+			reverse(FAST);
+			turnL(7*pwm_scale);
+			moveF(700, 110);
+			turnR(5*pwm_scale);
+		}
+	}
+
 //	if(pwm_dist > 15) {
-//		turnR((15-pwm_dist)*pwm_scale);
+//		turnR(20*pwm_scale);
 //	}
 //	else {
-//		turnL((pwm_dist -15)*pwm_scale);
+//		turnL(20*pwm_scale);
 //	}
 
-	double alpha_0 = 8.57142857;
-	double rebound = rebound_angle;
-	int angle = rebound_angle/alpha_0;
-	if(rebound_angle > 0) { // open space to left
-		turnL(angle*pwm_scale);
-	}
-	else { // open space to right
-		turnR(-1*angle*pwm_scale);
-	}
-	moveF(500, 50);
-	brake();
+//	double alpha_0 = 8.57142857;
+//	double rebound = rebound_angle;
+//	int angle = rebound_angle/alpha_0;
+//	if(rebound_angle > 0) { // open space to left
+//		turnL(angle*pwm_scale);
+//	}
+//	else { // open space to right
+//		turnR(-1*angle*pwm_scale);
+//	}
+	moveF(SLOW);
     return Obstacle_Detect_Transit_State;
 }
 
 
-eSystemEvent ReadEvent() {
-	eSystemEvent event = Light_Out_Of_Range_Event;
-	uint8_t curr_light = 0;
-	uint32_t curr_dist = 0;
-	double N = 21;
-	double alpha_0 = 8.57142857;
-	double num = 0; // numerator of rebound_angle
-	double denom = 0; // denominator of rebound_angle
-	int i = -N/2;
-	int bright = 240;
-	for(servo_pwm = 5; servo_pwm < 26; ++servo_pwm) {
-		__HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_3, servo_pwm); // send servo pwm sig
-		HAL_Delay(15);
-		curr_light = get_light_val();
-		if(curr_light < bright) {
-			pwm_light = servo_pwm;
-			bright = curr_light;
-			event = Light_Detect_Event;
-		}
-		curr_dist = get_dist_val();
-		sprintf((char*)buf, "%u\r\n", (unsigned int) curr_dist);
-		HAL_UART_Transmit(&huart2, buf, strlen((char*)buf), HAL_MAX_DELAY);
-		HAL_Delay(250);
-		if(curr_dist < close) {
-			pwm_dist = servo_pwm;
-			event = Obstacle_Detect_Event;
-		}
-		num += (i*alpha_0*curr_dist);
-		denom += curr_dist;
-		++i;
-	}
-	rebound_angle = num/denom;
-	return event;
-}
+
 /* USER CODE END 0 */
 
 /**
@@ -271,8 +477,8 @@ eSystemEvent ReadEvent() {
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-	eSystemState NextState = Init_State;
-	eSystemEvent NewEvent;
+	SystemState NextState = Init_State;
+	SystemEvent NewEvent;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -312,18 +518,15 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  NewEvent = ReadEvent();
+	  NewEvent = ReadEvent(&brightest_one);
 
 	  switch(NextState) {
 	  case Init_State:
 		  if(NewEvent == Obstacle_Detect_Event) {
 			  NextState = ObstacleDetectHandler();
 		  }
-		  else if(NewEvent == Light_Out_Of_Range_Event) {
-			  NextState = LightOutOfRangeHandler();
-		  }
 		  else {
-			  NextState = LightDetectHandler();
+			  NextState = LightOutOfRangeHandler();
 		  }
 		  break;
 	  case Transit_State:
@@ -331,16 +534,16 @@ int main(void)
 			  NextState = ObstacleDetectHandler();
 		  }
 		  else {
-			  NextState = Transit_State;
+			  NextState = LightDetectHandler();
 		  }
 		  break;
 	  case Obstacle_Detect_Transit_State:
 		  if(NewEvent == Obstacle_Detect_Event) {
 			  NextState = ObstacleDetectHandler();
 		  }
-		  else if(NewEvent == Light_Out_Of_Range_Event) {
-			  NextState = LightOutOfRangeHandler();
-		  }
+//		  else if(NewEvent == Light_Out_Of_Range_Event) {
+//			  NextState = LightOutOfRangeHandler();
+//		  }
 		  else {
 			  NextState = LightDetectHandler();
 		  }
